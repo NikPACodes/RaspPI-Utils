@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+set -u
+
+INTERVAL="${1:-1}"
+INTERVAL="${INTERVAL/,/.}"
+
+CPU_WARN=70
+CPU_CRIT=80
+NVME_WARN=60
+NVME_CRIT=70
+BAR_WIDTH=30
+
+RESET=$'\033[0m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+RED=$'\033[31m'
+CYAN=$'\033[36m'
+
+# Принимаются 1, 1.5 и 1,5, но не 0 и не отрицательные значения.
+if ! [[ "$INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+   ! awk -v value="$INTERVAL" 'BEGIN {exit !(value > 0)}'; then
+  echo "Использование: tempmon [интервал_в_секундах_больше_0]" >&2
+  exit 2
+fi
+
+command -v nvme >/dev/null 2>&1 || {
+  echo "Не установлен nvme-cli: sudo apt install -y nvme-cli" >&2
+  exit 1
+}
+
+NVME_CTRL="${NVME_CTRL:-}"
+if [[ -z "$NVME_CTRL" ]]; then
+  for path in /sys/class/nvme/nvme*; do
+    [[ -e "$path" ]] || continue
+    name="$(basename "$path")"
+    if [[ "$name" =~ ^nvme[0-9]+$ ]]; then
+      NVME_CTRL="/dev/$name"
+      break
+    fi
+  done
+fi
+
+[[ -n "$NVME_CTRL" && -e "$NVME_CTRL" ]] || {
+  echo "NVMe-контроллер не найден" >&2
+  exit 1
+}
+
+# Скрипт остаётся запущенным от обычного пользователя.
+# sudo применяется только к команде чтения SMART.
+SMART_WITH_SUDO=0
+if (( EUID != 0 )) && ! nvme smart-log "$NVME_CTRL" >/dev/null 2>&1; then
+  echo "Для чтения SMART NVMe требуется sudo."
+  sudo -v || exit 1
+  SMART_WITH_SUDO=1
+fi
+
+read_smart() {
+  if (( SMART_WITH_SUDO )); then
+    sudo -n nvme smart-log "$NVME_CTRL" 2>/dev/null
+  else
+    nvme smart-log "$NVME_CTRL" 2>/dev/null
+  fi
+}
+
+NVME_NAME="$(basename "$NVME_CTRL")"
+NVME_MODEL="$(cat "/sys/class/nvme/$NVME_NAME/model" 2>/dev/null | xargs)"
+[[ -n "$NVME_MODEL" ]] || NVME_MODEL="неизвестная модель"
+
+cpu_temp() {
+  local zone type raw
+
+  for zone in /sys/class/thermal/thermal_zone*; do
+    [[ -r "$zone/temp" ]] || continue
+    type="$(cat "$zone/type" 2>/dev/null)"
+
+    case "$type" in
+      cpu-thermal|soc_thermal|bcm2835_thermal)
+        raw="$(cat "$zone/temp")"
+        awk -v t="$raw" 'BEGIN {printf "%.1f", t/1000}'
+        return
+        ;;
+    esac
+  done
+
+  raw="$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0)"
+  awk -v t="$raw" 'BEGIN {printf "%.1f", t/1000}'
+}
+
+smart_value() {
+  local smart="$1" key="$2"
+
+  awk -F: -v key="$key" '
+    $1 ~ key {
+      if (match($2, /-?[0-9]+([.][0-9]+)?/))
+        print substr($2, RSTART, RLENGTH)
+      exit
+    }
+  ' <<< "$smart"
+}
+
+state() {
+  local value="${1%%.*}" warn="$2" crit="$3"
+
+  if (( value >= crit )); then
+    printf '%s|КРИТИЧНО' "$RED"
+  elif (( value >= warn )); then
+    printf '%s|ВЫСОКАЯ' "$YELLOW"
+  else
+    printf '%s|НОРМА' "$GREEN"
+  fi
+}
+
+bar() {
+  local value="${1%%.*}"
+  local color="$2"
+  local filled empty i
+
+  (( value < 0 )) && value=0
+  (( value > 100 )) && value=100
+
+  filled=$((value * BAR_WIDTH / 100))
+  empty=$((BAR_WIDTH - filled))
+
+  printf '%s' "$color"
+  for ((i = 0; i < filled; i++)); do
+    printf '█'
+  done
+
+  printf '%s' "$DIM"
+  for ((i = 0; i < empty; i++)); do
+    printf '░'
+  done
+
+  printf '%s' "$RESET"
+}
+
+temp_row() {
+  local label="$1" value="$2" warn="$3" crit="$4"
+  local result color text
+
+  result="$(state "$value" "$warn" "$crit")"
+  color="${result%%|*}"
+  text="${result#*|}"
+
+  printf '  %-5s %s%5.1f °C%s  ' "$label" "$color" "$value" "$RESET"
+  bar "$value" "$color"
+  printf '  %s%s%s\n' "$color" "$text" "$RESET"
+}
+
+STTY_ORIGINAL=""
+if [[ -t 0 ]]; then
+  STTY_ORIGINAL="$(stty -g 2>/dev/null || true)"
+
+  # Ctrl+Z становится читаемой клавишей, а не командой остановки процесса.
+  stty susp undef 2>/dev/null || true
+fi
+
+cleanup() {
+  local exit_code=$?
+
+  if [[ -n "$STTY_ORIGINAL" ]]; then
+    stty "$STTY_ORIGINAL" 2>/dev/null || true
+  fi
+
+  # Возвращаем курсор и сбрасываем оформление терминала.
+  printf '\033[?25h%s\n' "$RESET"
+  return "$exit_code"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+trap 'exit 0' TSTP
+
+printf '\033[?25l'
+
+while true; do
+  CPU="$(cpu_temp)"
+  SMART="$(read_smart || true)"
+
+  NVME="$(smart_value "$SMART" '^temperature[[:space:]]*$')"
+  USED="$(smart_value "$SMART" '^percentage_used[[:space:]]*$')"
+  WARNING="$(smart_value "$SMART" '^critical_warning[[:space:]]*$')"
+
+  NVME="${NVME:-0}"
+  USED="${USED:-?}"
+  WARNING="${WARNING:-?}"
+
+  printf '\033[H\033[2J'
+  printf '%s%s╔══════════════════════════════════════════════════════════════╗%s\n' "$BOLD" "$CYAN" "$RESET"
+  printf '%s%s║               RASPBERRY PI — ТЕМПЕРАТУРЫ                     ║%s\n' "$BOLD" "$CYAN" "$RESET"
+  printf '%s%s╚══════════════════════════════════════════════════════════════╝%s\n' "$BOLD" "$CYAN" "$RESET"
+  printf '  %s | %s | обновление: %s с\n' "$(date '+%d.%m.%Y %H:%M:%S')" "$(hostname)" "$INTERVAL"
+  printf '  NVMe: %s (%s)\n\n' "$NVME_MODEL" "$NVME_CTRL"
+
+  temp_row "CPU"  "$CPU"  "$CPU_WARN"  "$CPU_CRIT"
+  temp_row "NVMe" "$NVME" "$NVME_WARN" "$NVME_CRIT"
+
+  printf '\n  Load average: %s\n' "$(cut -d' ' -f1-3 /proc/loadavg)"
+  printf '  Износ NVMe: %s%% | critical_warning: %s\n' "$USED" "$WARNING"
+  printf '  %sПороги: CPU %s/%s °C, NVMe %s/%s °C%s\n' \
+    "$DIM" "$CPU_WARN" "$CPU_CRIT" "$NVME_WARN" "$NVME_CRIT" "$RESET"
+  printf '  %sВыход: Ctrl+C, Ctrl+Z, Esc, e или q%s\n' "$DIM" "$RESET"
+
+  key=""
+  if IFS= read -rsn1 -t "$INTERVAL" key; then
+    case "$key" in
+      $'\e'|$'\x1a'|e|E|q|Q)
+        exit 0
+        ;;
+    esac
+  fi
+done
