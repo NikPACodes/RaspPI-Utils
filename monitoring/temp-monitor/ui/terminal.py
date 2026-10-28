@@ -1,0 +1,134 @@
+"""
+ANSI-вывод и чтение клавиш терминала Linux.
+
+Terminal временно переводит TTY в режим ввода без Enter и восстанавливает
+исходные настройки при нормальном выходе и Ctrl+C.
+Esc, Ctrl+Z, E и Q завершают цикл.
+render() только выводит полученные показания и самостоятельно не обращается к оборудованию.
+"""
+import os
+import select
+import sys
+import termios
+import time
+import tty
+from datetime import datetime
+import socket
+
+from config import BAR_WIDTH, CPU_CRIT, CPU_WARN, NVME_CRIT, NVME_WARN
+
+RESET = '\033[0m'
+BOLD = '\033[1m'
+DIM = '\033[2m'
+GREEN = '\033[32m'
+YELLOW = '\033[33m'
+RED = '\033[31m'
+CYAN = '\033[36m'
+
+
+class Terminal:
+    """
+    Контекстный менеджер состояния терминала и чтения клавиш.
+    """
+    def __init__(self):
+        # Изначальные настройки терминала
+        self.original = None
+
+
+    def __enter__(self):
+        """
+        Подготовить терминал для интерактивной работы.
+        """
+        if sys.stdin.isatty():
+            # Получение файлового дескриптора stdin.
+            fd = sys.stdin.fileno()
+
+            # Сохраняем настройки терминала для восстановления (при завершении).
+            self.original = termios.tcgetattr(fd)
+
+            # Чтение клавиш сразу, без Enter.
+            tty.setcbreak(fd)
+
+            # Получение текущей настройки после включения cbreak
+            attrs = termios.tcgetattr(fd)
+
+            #  Отключаем управляющий символ VSUSP.
+            attrs[6][termios.VSUSP] = 0  # Ctrl+Z как байт, а не SIGTSTP
+
+            # Немедленное применение параметров.
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+        # Скрытие курсора
+        print('\033[?25l', end='', flush=True)
+        return self
+
+
+    def __exit__(self, *_):
+        """
+        Восстановление первоначальных настроек терминала.
+        """
+        if self.original is not None:
+            # Возвращение исходных настроек терминала
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self.original)
+        # Сброс оформления и возвращение курсора
+        print(f'\033[?25h{RESET}', end='\n', flush=True)
+
+
+    def should_exit(self, interval: float) -> bool:
+        """
+        Ожидание интервала или выхода, возвращая True при выходе.
+        """
+        if not sys.stdin.isatty():
+            time.sleep(interval)
+            return False
+
+        # select() ожидает данные на stdin.
+        # Максимальное время ожидания задаёт interval.
+        readable, _, _ = select.select([sys.stdin], [], [], interval)
+
+        return bool(readable and os.read(sys.stdin.fileno(), 1) in (b'\x1b',  # Esc
+                                                                    b'\x1a',  # Ctrl+Z
+                                                                    b'e',     # e
+                                                                    b'E',     # E
+                                                                    b'q',     # q
+                                                                    b'Q'))    # Q
+
+
+def _temperature(label: str, value: float | None, warn: int, crit: int) -> str:
+    """
+    Формирование цветной строки температуры или признак «н/д».
+    """
+    if value is None:
+        return f'  {label:<5}    н/д    {DIM}данные недоступны{RESET}'
+
+    color, status = ((RED, 'КРИТИЧНО') if int(value) >= crit else
+                     (YELLOW, 'ВЫСОКАЯ') if int(value) >= warn else (GREEN, 'НОРМА'))
+
+    # Ограничение шкалы диапазоном 0–100 °C.
+    # и подсчет количества заполненных символов.
+    filled = max(0, min(100, int(value))) * BAR_WIDTH // 100
+
+    # Создание цветовой шкалы
+    bar = f'{color}{"█" * filled}{DIM}{"░" * (BAR_WIDTH - filled)}{RESET}'
+    return f'  {label:<5} {color}{value:5.1f} °C{RESET}  {bar}  {color}{status}{RESET}'
+
+
+def render(interval, controller, model, cpu, nvme, load, cpu_fan, noctua_fan):
+    """
+    Перерисовка экран по готовым измерениям датчиков от monitor.py.
+    """
+    print('\033[H\033[2J', end='')
+    print(f'{BOLD}{CYAN}╔══════════════════════════════════════════════════════════════╗{RESET}')
+    print(f'{BOLD}{CYAN}║               RASPBERRY PI — ТЕМПЕРАТУРЫ                     ║{RESET}')
+    print(f'{BOLD}{CYAN}╚══════════════════════════════════════════════════════════════╝{RESET}')
+    print(f'  {datetime.now():%d.%m.%Y %H:%M:%S} | {socket.gethostname()} | обновление: {interval:g} с')
+    print(f'  NVMe: {model} ({controller})\n')
+    print(_temperature('CPU', cpu, CPU_WARN, CPU_CRIT))
+    print(_temperature('NVMe', nvme.temperature, NVME_WARN, NVME_CRIT))
+    print(f'\n  Load average: {load}')
+    used = f'{nvme.percentage_used}%' if nvme.percentage_used is not None else 'н/д'
+    print(f'  Износ NVMe: {used} | critical_warning: {nvme.critical_warning or "н/д"}')
+    print(f'  CPU Fan: RPM {cpu_fan.rpm if cpu_fan.rpm is not None else "н/д"} | PWM {cpu_fan.pwm_percent if cpu_fan.pwm_percent is not None else "н/д"}')
+    print(f'  Noctua:  RPM {noctua_fan.rpm if noctua_fan.rpm is not None else "н/д"} | PWM {noctua_fan.pwm_percent if noctua_fan.pwm_percent is not None else "н/д"}')
+    print(f'  {DIM}Пороги: CPU {CPU_WARN}/{CPU_CRIT} °C, NVMe {NVME_WARN}/{NVME_CRIT} °C{RESET}')
+    print(f'  {DIM}Выход: Ctrl+C, Ctrl+Z, Esc, e или q{RESET}', flush=True)
