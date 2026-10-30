@@ -1,5 +1,6 @@
 """
-Модель обнаружения NVMe-накопителей и чтения SMART через nvme-cli."""
+Модель обнаружения NVMe-накопителей и чтения SMART через nvme-cli.
+"""
 import os
 import re
 import shutil
@@ -10,39 +11,53 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class NVMeSnapshot:
-    # Температура NVMe в °C
-    temperature: float | None
-    # Показатель износа накопителя по SMART
-    percentage_used: int | None
-    # Содержимое поля critical_warning
-    critical_warning: str | None
-
-
-def locate_controller() -> Path:
     """
-    Поиск доступного NVMe-контроллера Linux.
+    SMART одного NVMe
+    """
+    # Температура NVMe в °C
+    temperature: float | None = None
+    # Показатель износа накопителя по SMART
+    percentage_used: int | None = None
+    # Содержимое поля critical_warning
+    critical_warning: str | None = None
 
-    Переменная окружения NVME_CTRL позволяет вручную выбрать контроллер.
+@dataclass(frozen=True)
+class NVMeDevice:
+    """
+    Информацию об одном NVMe-контроллере
+    """
+    # Путь к NVMe-контроллеру
+    controller: Path
+    # Модель накопителя
+    model: str
+    # Показатели SMART
+    snapshot: NVMeSnapshot
+    # Ошибка чтения
+    error: str | None = None
+
+
+def locate_controllers() -> list[Path]:
+    """
+    Поиск доступных NVMe-контроллеров Linux.
+
+    Переменная окружения NVME_CTRL позволяет вручную выбрать контроллеры.
     """
     # Проверяем переменную окружения NVME_CTRL
     override = os.environ.get('NVME_CTRL', '').strip()
 
     if override:
-        path = Path(override)
-        if not path.exists():
-            raise RuntimeError(f'NVMe-контроллер не найден: {path}')
-        return path
+        devices = [Path(name.strip()) for name in override.split(',') if name.strip()]
+    else:
+        # Ищем NVMe через Linux sysfs
+        devices = [Path('/dev') / p.name for p in Path('/sys/class/nvme').glob('nvme*')
+                       if re.fullmatch(r'nvme\d+', p.name)]
 
-    # Проверяем список NVMe-контроллеров Linux
-    for item in sorted(Path('/sys/class/nvme').glob('nvme*')):
+    # Убираем дубликаты и сортируем по номеру контроллера
+    result = sorted(set(devices), key=lambda p: (
+        int(re.fullmatch(r'nvme(\d+)', p.name).group(1))
+        if re.fullmatch(r'nvme(\d+)', p.name) else float('inf'), str(p)))
 
-        # Проверка соответствия имени контроллера формату nvme
-        # Прим.: nvme0, nvme1, ...  (nvme0n1 не подходит т.к. это накопитель, а не контроллер)
-        if re.fullmatch(r'nvme\d+', item.name):
-            device = Path('/dev') / item.name
-            if device.exists():
-                return device
-    raise RuntimeError('NVMe-контроллер не найден')
+    return [p for p in result if p.exists()]
 
 
 def model(controller: Path) -> str:
@@ -61,58 +76,42 @@ class NVMeReader:
     """
     Чтение SMART-показателей NVMe.
 
-    Выполнение команды nvme smart-log требует sudo.
+    При недостаточных правах доступа может потребоваться sudo.
     """
-    def __init__(self, controller: Path):
+    def __init__(self, controller: Path, use_sudo: bool = False):
         """
-        Подготовка чтения SMART указанного контроллера
+        Подготовка чтения SMART одного контроллера
         """
-        if not shutil.which('nvme'):
-            raise RuntimeError('Не установлен nvme-cli: sudo apt install -y nvme-cli')
-
         self.controller = controller
         # По умолчанию пытаемся читать SMART от имени текущего пользователя.
-        self.sudo = False
-
-        # Пробное чтение без root
-        if os.geteuid() != 0 and self._command(use_sudo=False).returncode != 0:
-            print('Для чтения SMART NVMe требуется sudo.', flush=True)
-
-            try:
-                # Запрос sudo
-                result = subprocess.run(['sudo', '-v'], check=False)
-            except OSError as exc:
-                raise RuntimeError(f'Не удалось запустить sudo: {exc}') from exc
-
-            if result.returncode != 0:
-                raise RuntimeError('Не удалось получить права для SMART NVMe')
-            # Дальнейшие команды SMART будут выполняться через sudo
-            self.sudo = True
-
-        # Проверяем SMART сразу, а не заменяем ошибки подключения фиктивным нулём.
-        if self._command(self.sudo).returncode != 0:
-            raise RuntimeError(f'Не удаётся прочитать SMART: {controller}')
+        self.sudo = use_sudo
 
 
-    def _command(self, use_sudo: bool) -> subprocess.CompletedProcess[str]:
+    def _command(self) -> subprocess.CompletedProcess[str]:
         """
         Выполнение команды получения SMART NVMe.
         """
         cmd = ['nvme', 'smart-log', str(self.controller)]
-        if use_sudo:
+        if self.sudo:
             cmd = ['sudo', '-n', *cmd]
-        return subprocess.run(cmd, capture_output=True, text=True, check=False)
+        return subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=5)
 
 
-    def read(self) -> NVMeSnapshot:
+    def read(self) -> tuple[NVMeSnapshot, str | None]:
         """
         Чтение SMART NVMe и извлечение показателей.
         """
-        # Выполнение nvme smart-log.
-        result = self._command(self.sudo)
+        try:
+            # Выполнение nvme smart-log.
+            result = self._command()
+        except subprocess.TimeoutExpired:
+            return NVMeSnapshot(), 'Превышено время ожидания SMART (5 сек)'
+        except OSError as exc:
+            return NVMeSnapshot(), str(exc)
 
         if result.returncode != 0:
-            return NVMeSnapshot(None, None, None)
+            detail = result.stderr.strip().splitlines()
+            return NVMeSnapshot(), (detail[-1][:150] if detail else 'Ошибка чтения SMART')
 
         data = {}
         for line in result.stdout.splitlines():
@@ -120,11 +119,10 @@ class NVMeReader:
             if sep:
                 data[key.strip().lower()] = value.strip()
 
-        def number(key: str, as_float: bool = False) -> int | None:
+        def number(key: str, as_float: bool = False) -> int|float|None:
             # Извлечение первого числа из SMART-поля.
             pattern = r"-?\d+(?:\.\d+)?" if as_float else r"-?\d+"
             match = re.search(pattern, data.get(key, ''))
-
             if not match:
                 return None
             if as_float:
@@ -135,3 +133,55 @@ class NVMeReader:
         used = number('percentage_used')                  # износ
         warning = data.get('critical_warning')
         return NVMeSnapshot(temp, used, warning)
+
+
+
+class NVMeMonitor:
+    """
+    Менеджер мониторинга NVMe-контроллеров.
+    """
+    def __init__(self):
+        # Получаем список обнаруженных устройств
+        self.controllers = locate_controllers()
+        self.readers: list[NVMeReader] = []
+
+        if not self.controllers:
+            return
+
+        # Проверка доступности команды nvme
+        if not shutil.which('nvme'):
+            # Нет утилиты: каждый диск покажет н/д, но монитор работает.
+            self.readers = [NVMeReader(p) for p in self.controllers]
+            return
+
+        # По умолчанию читаем SMART без sudo
+        use_sudo = False
+
+        # Пробное чтение без root
+        if os.geteuid() != 0:
+            for controller in self.controllers:
+                if NVMeReader(controller).read()[1] is not None:
+                    print('Чтение SMART требует sudo; проверяем доступ...', flush=True)
+                    try:
+                        # Запрос sudo
+                        use_sudo = subprocess.run(['sudo', '-v'], check=False).returncode == 0
+                    except OSError:
+                        use_sudo = False
+
+                    break
+
+        self.readers = [NVMeReader(p, use_sudo) for p in self.controllers]
+
+
+    def read(self) -> list[NVMeDevice]:
+        """
+        Получение данных всех NVMe
+        """
+        devices = []
+        for reader in self.readers:
+            snapshot, error = reader.read()
+            devices.append(NVMeDevice(controller = reader.controller,
+                                      model = model(reader.controller),
+                                      snapshot = snapshot,
+                                      error = error))
+        return devices

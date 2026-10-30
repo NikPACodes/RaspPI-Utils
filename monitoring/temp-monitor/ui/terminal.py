@@ -16,6 +16,7 @@ from datetime import datetime
 import socket
 
 from config import BAR_WIDTH, CPU_CRIT, CPU_WARN, NVME_CRIT, NVME_WARN
+from sensors.nvme import NVMeDevice
 
 RESET = '\033[0m'
 BOLD = '\033[1m'
@@ -46,17 +47,19 @@ class Terminal:
             # Сохраняем настройки терминала для восстановления (при завершении).
             self.original = termios.tcgetattr(fd)
 
-            # Чтение клавиш сразу, без Enter.
-            tty.setcbreak(fd)
-
-            # Получение текущей настройки после включения cbreak
-            attrs = termios.tcgetattr(fd)
-
-            #  Отключаем управляющий символ VSUSP.
-            attrs[6][termios.VSUSP] = 0  # Ctrl+Z как байт, а не SIGTSTP
-
-            # Немедленное применение параметров.
-            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            try:
+                # Чтение клавиш сразу, без Enter.
+                tty.setcbreak(fd)
+                # Получение текущей настройки после включения cbreak
+                attrs = termios.tcgetattr(fd)
+                #  Отключаем управляющий символ VSUSP.
+                attrs[6][termios.VSUSP] = 0  # Ctrl+Z как байт, а не SIGTSTP
+                # Немедленное применение параметров.
+                termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            except BaseException:
+                # Возвращение исходных настроек терминала
+                termios.tcsetattr(fd, termios.TCSANOW, self.original)
+                raise
 
         # Скрытие курсора
         print('\033[?25l', end='', flush=True)
@@ -67,11 +70,13 @@ class Terminal:
         """
         Восстановление первоначальных настроек терминала.
         """
-        if self.original is not None:
-            # Возвращение исходных настроек терминала
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self.original)
-        # Сброс оформления и возвращение курсора
-        print(f'\033[?25h{RESET}', end='\n', flush=True)
+        try:
+            if self.original is not None:
+                # Возвращение исходных настроек терминала
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self.original)
+        finally:
+            # Сброс оформления и возвращение курсора
+            print(f'\033[?25h{RESET}', end='\n', flush=True)
 
 
     def should_exit(self, interval: float) -> bool:
@@ -113,7 +118,23 @@ def _temperature(label: str, value: float | None, warn: int, crit: int) -> str:
     return f'  {label:<5} {color}{value:5.1f} °C{RESET}  {bar}  {color}{status}{RESET}'
 
 
-def render(interval, controller, model, cpu, nvme, load, cpu_fan, noctua_fan):
+def _nvme_details(device: NVMeDevice) -> str:
+    """
+    Отрисовка данных NVMe: износ, SMART предупреждение или причину недоступности.
+    """
+    snap = device.snapshot
+    # Износ
+    used = f'{snap.percentage_used}%' if snap.percentage_used is not None else 'н/д'
+    # SMART предупреждения
+    warning = snap.critical_warning if snap.critical_warning is not None else 'н/д'
+    detail = f'    Износ: {used} | critical_warning: {warning}'
+    if device.error:
+        detail += f' | SMART: {device.error}'
+    return detail
+
+
+def render(interval, cpu, devices,
+           load, cpu_fan, noctua_fan):
     """
     Перерисовка экран по готовым измерениям датчиков от monitor.py.
     """
@@ -122,12 +143,17 @@ def render(interval, controller, model, cpu, nvme, load, cpu_fan, noctua_fan):
     print(f'{BOLD}{CYAN}║               RASPBERRY PI — ТЕМПЕРАТУРЫ                     ║{RESET}')
     print(f'{BOLD}{CYAN}╚══════════════════════════════════════════════════════════════╝{RESET}')
     print(f'  {datetime.now():%d.%m.%Y %H:%M:%S} | {socket.gethostname()} | обновление: {interval:g} с')
-    print(f'  NVMe: {model} ({controller})\n')
     print(_temperature('CPU', cpu, CPU_WARN, CPU_CRIT))
-    print(_temperature('NVMe', nvme.temperature, NVME_WARN, NVME_CRIT))
+    if devices:
+        print(f'\n  NVMe-контроллеры: {len(devices)}')
+        for dev in devices:
+            print(f'  {dev.controller}: {dev.model}')
+            print(_temperature(dev.controller.name, dev.snapshot.temperature,
+                               NVME_WARN, NVME_CRIT))
+            print(_nvme_details(dev))
+    else:
+        print(f'\n  NVMe: {DIM}не обнаружены{RESET}')
     print(f'\n  Load average: {load}')
-    used = f'{nvme.percentage_used}%' if nvme.percentage_used is not None else 'н/д'
-    print(f'  Износ NVMe: {used} | critical_warning: {nvme.critical_warning or "н/д"}')
     print(f'  CPU Fan: RPM {cpu_fan.rpm if cpu_fan.rpm is not None else "н/д"} | PWM {cpu_fan.pwm_percent if cpu_fan.pwm_percent is not None else "н/д"}')
     print(f'  Noctua:  RPM {noctua_fan.rpm if noctua_fan.rpm is not None else "н/д"} | PWM {noctua_fan.pwm_percent if noctua_fan.pwm_percent is not None else "н/д"}')
     print(f'  {DIM}Пороги: CPU {CPU_WARN}/{CPU_CRIT} °C, NVMe {NVME_WARN}/{NVME_CRIT} °C{RESET}')

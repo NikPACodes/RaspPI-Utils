@@ -77,28 +77,9 @@ def main() -> int:
     # -------------------------------
     # 2. ИНИЦИАЛИЗАЦИЯ NVMe
     # -------------------------------
-
     # NVMe — необязательный компонент.
-    controller = None
-    model = "не обнаружен"
-    reader = None
-    try:
-        # Поиск контроллер
-        controller = nvme.locate_controller()
-        # Определение модели
-        model = nvme.model(controller)
-        # Создание SMART-reader.
-        # Проверка sudo производится только при запуске.
-        reader = nvme.NVMeReader(controller)
-    except RuntimeError as exc:
-        print(f"NVMe недоступен: {exc}")
-
-    # Читаем SMART только при наличии доступного NVMe.
-    if reader is not None:
-        nvme_snapshot = reader.read()
-    else:
-        nvme_snapshot = nvme.NVMeSnapshot(temperature=None, percentage_used=None, critical_warning=None)
-
+    # Поиск NVMe выполняем один раз при запускепоиск выполняем один раз при запуске.
+    nvme_monitor = nvme.NVMeMonitor()
 
     # -------------------------------
     # 3. ОБРАБОТКА SIGTSTP
@@ -116,10 +97,8 @@ def main() -> int:
     with Terminal() as terminal:
         while True:
             render(args.interval,              # Интервал обновления
-                   controller,                 # Путь к NVMe-контроллеру
-                   model,                      # Модель накопителя
                    cpu.read_temperature(),     # Текущая температура CPU
-                   nvme_snapshot,              # Текущие значения SMART NVMe
+                   nvme_monitor.read(),        # Список NVMe: модель, температура, износ, SMART и ошибки
                    load_average(),             # Средняя нагрузка Linux
                    fans.read_cpu_fan(),        # Показатели вентилятора CPU
                    fans.read_noctua_fan())     # Показатели Noctua
