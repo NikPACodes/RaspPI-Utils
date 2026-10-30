@@ -4,7 +4,6 @@
 """
 import argparse
 import math
-# import os
 import re
 import signal
 from pathlib import Path
@@ -78,13 +77,28 @@ def main() -> int:
     # -------------------------------
     # 2. ИНИЦИАЛИЗАЦИЯ NVMe
     # -------------------------------
-    # Поиск контроллер
-    controller = nvme.locate_controller()
-    # Определение модели
-    model = nvme.model(controller)
-    # Создание SMART-reader.
-    # Проверка sudo производится только при запуске.
-    reader = nvme.NVMeReader(controller)
+
+    # NVMe — необязательный компонент.
+    controller = None
+    model = "не обнаружен"
+    reader = None
+    try:
+        # Поиск контроллер
+        controller = nvme.locate_controller()
+        # Определение модели
+        model = nvme.model(controller)
+        # Создание SMART-reader.
+        # Проверка sudo производится только при запуске.
+        reader = nvme.NVMeReader(controller)
+    except RuntimeError as exc:
+        print(f"NVMe недоступен: {exc}")
+
+    # Читаем SMART только при наличии доступного NVMe.
+    if reader is not None:
+        nvme_snapshot = reader.read()
+    else:
+        nvme_snapshot = nvme.NVMeSnapshot(temperature=None, percentage_used=None, critical_warning=None)
+
 
     # -------------------------------
     # 3. ОБРАБОТКА SIGTSTP
@@ -105,7 +119,7 @@ def main() -> int:
                    controller,                 # Путь к NVMe-контроллеру
                    model,                      # Модель накопителя
                    cpu.read_temperature(),     # Текущая температура CPU
-                   reader.read(),              # Текущие значения SMART NVMe
+                   nvme_snapshot,              # Текущие значения SMART NVMe
                    load_average(),             # Средняя нагрузка Linux
                    fans.read_cpu_fan(),        # Показатели вентилятора CPU
                    fans.read_noctua_fan())     # Показатели Noctua
