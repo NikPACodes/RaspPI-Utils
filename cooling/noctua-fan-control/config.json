@@ -1,0 +1,43 @@
+{
+  "gpio": {
+    "pwm_gpio": 18,
+    "tach_gpio": 17,
+    "pwm_frequency_hz": 25000,
+    "tach_pulses_per_rev": 2
+  },
+  "control": {
+    "mode": "auto",
+    "cpu_offset_c": 10.0,
+    "hysteresis_c": 1.5,
+    "update_interval_s": 1.0,
+    "min_running_pwm": 51,
+    "kickstart_seconds": 0.7,
+    "manual_pwm": 128,
+    "emergency_cpu_c": 75.0,
+    "emergency_nvme_c": 65.0,
+    "levels": [
+      [35.0, 0],
+      [38.0, 51],
+      [42.0, 77],
+      [46.0, 115],
+      [50.0, 153],
+      [55.0, 191],
+      [60.0, 230],
+      [65.0, 255]
+    ]
+  },
+  "health": {
+    "enabled": true,
+    "min_pwm_for_check": 77,
+    "min_rpm_ratio": 0.75,
+    "warn_after_seconds": 30,
+    "baseline_rpm": {}
+  },
+  "failsafe": {
+    "sensor_failure_pwm": 255,
+    "tach_fail_safe_enabled": true,
+    "tach_zero_seconds": 5.0,
+    "tach_zero_min_pwm": 77,
+    "tach_failure_pwm": 255
+  }
+}
