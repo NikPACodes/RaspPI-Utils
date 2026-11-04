@@ -133,6 +133,17 @@ def status(clear=False):
     fan_name = cfg.get("fan", {}).get("name", "Unknown Fan")
     hostname = os.uname().nodename
 
+    print(fan_name)
+    print(f"Host: {hostname}")
+    print(f"Board: {system_model()}")
+    print("═" * 76)
+
+    if not state:
+        print("Нет status.json. Сначала запусти: sudo python3 noctua_daemon.py")
+        print_curve("CPU levels", cfg["control"]["cpu_levels"])
+        print_curve("NVMe levels", cfg["control"]["nvme_levels"])
+        return
+
     age = time.time() - float(state["timestamp"])
     maintenance_code = state.get("maintenance")
     maintenance = {
@@ -156,15 +167,6 @@ def status(clear=False):
 
     alarms = state.get("alarms") or []
 
-    print(fan_name)
-    print(f"Host: {hostname}")
-    print(f"Board: {system_model()}")
-    print("═" * 76)
-    if not state:
-        print("Нет status.json. Сначала запусти: sudo python3 noctua_daemon.py")
-        print_curve("CPU levels", cfg["control"]["cpu_levels"])
-        print_curve("NVMe levels", cfg["control"]["nvme_levels"])
-        return
     print(f"Status age:          {age:.1f} s")
     print(f"Mode:                {state['mode']}")
     print(f"PWM сейчас:          {state['applied_pwm']}/255 ({pct(state['applied_pwm']):.1f}%)")
@@ -235,10 +237,10 @@ def settings():
     control = cfg["control"]
     health = cfg["health"]
     failsafe = cfg["failsafe"]
-
+    fan_name = cfg.get("fan", {}).get("name", "Unknown Fan")
     baseline = health.get("baseline_rpm",{})
 
-    print("Настройки Noctua")
+    print(f"Настройки {fan_name}")
     print("═" * 76)
     print(f"Mode:                {control['mode']}")
     print(f"Update interval:     {control['update_interval_s']} s")
@@ -324,24 +326,19 @@ def set_pwm(value):
 # ------------------------------------------------------------
 # Edit LEVEL
 # ------------------------------------------------------------
-def set_level(i, temp, pwm):
-    i, temp, pwm = int(i), float(temp), int(pwm)
-    cfg = load_cfg(); levels = [list(x) for x in cfg["control"]["levels"]]
-    if not 0 <= i < len(levels) or not 0 <= pwm <= 255:
-        raise SystemExit("Неверный LEVEL или PWM")
-    levels[i] = [temp, pwm]
-    ts = [float(x[0]) for x in levels]
-    if ts != sorted(ts) or len(ts) != len(set(ts)):
-        raise SystemExit("Температуры LEVEL должны строго возрастать")
-    cfg["control"]["levels"] = levels; save_cfg(cfg)
-
-
 def set_level(sensor, index, temp, pwm):
     """
-    Изменить одну точку кривой.
+    Изменить один LEVEL температурной кривой CPU или NVMe.
+
     sensor:
-        cpu
-        nvme
+        "cpu"  — изменить cpu_levels
+        "nvme" — изменить nvme_levels
+    index:
+        Номер LEVEL, начиная с 0
+    temp:
+        Температура срабатывания LEVEL, °C
+    pwm:
+        PWM для данного LEVEL, от 0 до 255
     """
     sensor = sensor.lower()
     if sensor not in ("cpu", "nvme"):
