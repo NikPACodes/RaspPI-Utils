@@ -159,4 +159,9 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (ValueError, RuntimeError, OSError) as exc:
+        # Ошибка настроек — понятное сообщение, без длинного traceback.
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None

@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import json
 import os
+import fcntl
+from contextlib import contextmanager
 import signal
 import statistics
 import threading
@@ -34,7 +36,7 @@ from typing import Any
 from gpiozero import DigitalInputDevice, PWMOutputDevice
 from gpiozero.pins.lgpio import LGPIOFactory
 
-from noctua.config import load_cfg
+from noctua.config import load_cfg, validate_config as validate_config_shared
 from noctua.paths import CONFIG, STATUS
 
 STOP = threading.Event()
@@ -222,8 +224,10 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
 def load_daemon_config() -> dict[str, Any]:
     """
-    Загрузка и проверка config.json"""
-    return validate_config(load_cfg())
+    Загрузка и проверка config.json
+    """
+    # Сначала общий валидатор CLI/daemon, затем историческая проверка daemon.
+    return validate_config(validate_config_shared(load_cfg()))
 
 
 # ------------------------------------------------------------
@@ -288,6 +292,8 @@ class Controller:
     def __init__(self) -> None:
         self.cfg = load_daemon_config()
         self.cfg_mtime = CONFIG.stat().st_mtime_ns
+        self.cfg_rejected_mtime = None
+        self.config_error = None
 
         gpio = self.cfg["gpio"]
         initial_pwm = int(self.cfg["failsafe"]["sensor_failure_pwm"])
@@ -375,22 +381,34 @@ class Controller:
     def reload_config(self) -> None:
         """
         Перечитывание config.json при изменении.
+
+        ! В случае ошибки новой конфигурации записываем status, но продолжаем
+        работать на последней корректной конфигурации, сохраняя PWM.
         """
         try:
             mtime = CONFIG.stat().st_mtime_ns
-        except OSError:
+        except OSError as exc:
+            self.config_error = f"CONFIG_MISSING: {exc}"
             return
 
-        if mtime == self.cfg_mtime:
+        if mtime in (self.cfg_mtime, self.cfg_rejected_mtime):
             return
 
-        new_cfg = load_daemon_config()
-        new_gpio = new_cfg["gpio"]
-        new_signature = (int(new_gpio["pwm_gpio"]), int(new_gpio["tach_gpio"]), int(new_gpio["pwm_frequency_hz"]))
+        # Проверка и применение всех настроек.
+        try:
+            new_cfg = load_daemon_config()
+            new_gpio = new_cfg["gpio"]
+            new_signature = (int(new_gpio["pwm_gpio"]), int(new_gpio["tach_gpio"]),
+                             int(new_gpio["pwm_frequency_hz"]))
 
-        if new_signature != self.hardware_signature:
-            raise RuntimeError("Изменены pwm_gpio/tach_gpio/pwm_frequency_hz. "
-                               "Для применения аппаратных параметров требуется перезапуск daemon.")
+            if new_signature != self.hardware_signature:
+                raise ValueError("Изменены pwm_gpio/tach_gpio/pwm_frequency_hz. "
+                                 "Для применения требуется перезапуск daemon.")
+        except Exception as exc:
+            self.cfg_rejected_mtime = mtime
+            self.config_error = f"CONFIG_REJECTED: {exc}"
+            print(f"[noctua] {self.config_error}", flush=True)
+            return
 
         sample_count = int(new_cfg["control"]["nvme_average_samples"])
         old_samples = list(self.nvme_history)
@@ -398,6 +416,8 @@ class Controller:
 
         self.cfg = new_cfg
         self.cfg_mtime = mtime
+        self.cfg_rejected_mtime = None
+        self.config_error = None
         print("[noctua] config reloaded", flush=True)
 
 
@@ -412,6 +432,9 @@ class Controller:
         nvme_current, nvme_devices = nvme_current_temp_c()
         if nvme_current is not None:
             self.nvme_history.append(nvme_current)
+        else:
+            # Отключенный NVMe не должен оставлять старое среднее как актуальное.
+            self.nvme_history.clear()
         nvme_average = statistics.fmean(self.nvme_history) if self.nvme_history else None
         return cpu, nvme_current, nvme_average, nvme_devices
 
@@ -667,6 +690,7 @@ class Controller:
             STATUS,
             {
                 "timestamp": time.time(),
+                "daemon_pid": os.getpid(),
                 "uptime_s": round(time.time() - self.started, 1),
                 "mode": self.cfg["control"]["mode"],
                 "gpiochip": self.gpiochip,
@@ -690,7 +714,8 @@ class Controller:
                 "expected_rpm": None if expected_rpm is None else int(round(expected_rpm)),
                 "rpm_ratio": None if rpm_ratio is None else round(rpm_ratio, 3),
                 "maintenance": maintenance,
-                "alarms": alarms,
+                "alarms": alarms + ([self.config_error] if self.config_error else []),
+                "config_error": self.config_error,
             },
         )
 
@@ -756,6 +781,26 @@ class Controller:
 # ============================================================
 # Main
 # ============================================================
+@contextmanager
+def daemon_instance_lock():
+    """
+    Защита от запуска второй копии daemon на тех же GPIO.
+
+    Файл .daemon.lock остаётся на диске; блокировка снимается автоматически
+    при завершении процесса. Удалять lock-файл вручную нельзя.
+    """
+    lock_path = CONFIG.with_name(".daemon.lock")
+    fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Noctua_daemon уже запущен. Запуск второй копии запрещен.") from None
+        yield
+    finally:
+        os.close(fd)
+
+
 def stop_handler(*_: Any) -> None:
     """
     Обработка SIGINT/SIGTERM.
@@ -770,17 +815,20 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop_handler)
     signal.signal(signal.SIGTERM, stop_handler)
 
-    controller: Controller | None = None
     try:
-        controller = Controller()
-        controller.loop()
-        return 0
+        # Lock охватывает и освобождение GPIO в close().
+        with daemon_instance_lock():
+            controller: Controller | None = None
+            try:
+                controller = Controller()
+                controller.loop()
+                return 0
+            finally:
+                if controller is not None:
+                    controller.close()
     except Exception as exc:
         print(f"[noctua] FATAL: {exc}", flush=True)
         return 1
-    finally:
-        if controller is not None:
-            controller.close()
 
 
 if __name__ == "__main__":

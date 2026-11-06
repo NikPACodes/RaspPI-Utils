@@ -13,7 +13,8 @@
 
 Данные Noctua берутся из status.json, который формирует noctua_daemon.
 """
-import os, time
+import os
+import time
 from pathlib import Path
 
 from noctua.config import read_json, load_cfg
@@ -100,7 +101,22 @@ def status(clear=False):
         print_curve("NVMe levels", cfg["control"]["nvme_levels"])
         return
 
-    age = time.time() - float(state["timestamp"])
+    # --------------------------------------------------------
+    # Stale status: старые RPM нельзя показывать как текущие.
+    # --------------------------------------------------------
+    try:
+        age = time.time() - float(state["timestamp"])
+        max_age = max(3.0, 3.0 * float(cfg["control"]["update_interval_s"]))
+        stale = not (-2 <= age <= max_age)
+    except (KeyError, ValueError, TypeError, OverflowError):
+        age, stale = float("inf"), True
+    if stale:
+        print(f"STATUS STALE / DAEMON OFFLINE: данные обновлялись {age:.1f} s назад")
+        print("Текущие RPM/PWM недоступны — ниже только сохранённые настройки.")
+        print_curve("CPU levels", cfg["control"]["cpu_levels"])
+        print_curve("NVMe levels", cfg["control"]["nvme_levels"])
+        return
+
     maintenance_code = state.get("maintenance")
     maintenance = {
         "OK": "OK",
@@ -299,6 +315,7 @@ def cpu_fan_info():
     print("CPU/HAT fan (read-only)")
     print("═" * 76)
     print(f"Источник hwmon:       {source or '—'}")
+    # Необходимо подтверждение что источник с Waveshare HAT/CPU fan.
     print(f"RPM:                  {show_value(rpm, ' rpm')}")
     print(f"PWM:                  {pwm_text}")
     print("\nfan_temp* из config.txt")
