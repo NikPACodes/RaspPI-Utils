@@ -19,7 +19,7 @@ import sys
 import time
 import pytest
 
-from conftest import ROOT, daemon
+from conftest import ROOT, daemon, FakePWM
 from noctua import monitor
 
 pytestmark = pytest.mark.runtime
@@ -105,6 +105,7 @@ def test_03_daemon_three_cycles_with_fake_gpio(project, monkeypatch):
 
     monkeypatch.setattr(daemon, 'STOP', StopAfter(3))
     monkeypatch.setattr(daemon, 'find_rp1_gpiochip', lambda: 0)
+    monkeypatch.setattr(daemon, 'RP1HardwarePWM', FakePWM)
     monkeypatch.setattr(daemon, 'cpu_temp_c', lambda: 60.0)
     monkeypatch.setattr(daemon, 'nvme_current_temp_c', lambda: (40.0, [40.0]))
 

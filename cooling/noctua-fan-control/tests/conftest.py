@@ -17,10 +17,15 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 class FakePWM:
-    """Запоминает назначение вывода и все выставленные значения duty."""
+    """
+    Запоминает назначение вывода и все выставленные значения duty.
+    """
     def __init__(self, pin, *, initial_value=0, frequency=100, **kwargs):
+        # Имитируем метаданные аппаратного PWM для status.json
         self.pin = pin
         self.frequency = frequency
+        self.chip = Path("pwmchip0")
+        self.channel = self.chip / "pwm2"
         self.values = []
         self._value = None
         self.value = initial_value

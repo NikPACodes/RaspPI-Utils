@@ -22,6 +22,8 @@ AUTO:
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 import os
 import fcntl
 from contextlib import contextmanager
@@ -33,10 +35,11 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-from gpiozero import DigitalInputDevice, PWMOutputDevice
+from gpiozero import DigitalInputDevice
 from gpiozero.pins.lgpio import LGPIOFactory
 
 from noctua.config import load_cfg, validate_config as validate_config_shared
+from noctua.hardware import RP1HardwarePWM
 from noctua.paths import CONFIG, STATUS
 
 STOP = threading.Event()
@@ -121,18 +124,25 @@ def nvme_current_temp_c() -> tuple[float | None, list[float]]:
 
 
 def find_rp1_gpiochip() -> int:
-    """
-    Поиск GPIO-контроллера RP1 по label.
-    """
-    for path in Path("/sys/class/gpio").glob("gpiochip*"):
-        try:
-            label = (path / "label").read_text().strip().lower()
-        except OSError:
-            continue
+    """Find the actual /dev/gpiochipN device with label pinctrl-rp1.
 
-        if "pinctrl-rp1" in label:
-            return int(path.name.removeprefix("gpiochip"))
-    raise RuntimeError("Не найден GPIO-контроллер RP1 по label pinctrl-rp1")
+    The numeric suffix of /sys/class/gpio/gpiochipN is a GPIO *base*, not
+    necessarily the character device number understood by LGPIOFactory.
+    """
+    try:
+        result = subprocess.run(['gpiodetect'], capture_output=True,
+                                text=True, check=False, timeout=3)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError('gpiodetect недоступен; требуется установленный пакет gpiod') from exc
+    if result.returncode != 0:
+        raise RuntimeError(f'gpiodetect завершился с ошибкой: {result.stderr.strip()}')
+    matches = [int(m.group(1)) for line in result.stdout.splitlines()
+               if (m := re.match(r'^gpiochip(\d+)\s+\[pinctrl-rp1\]', line.strip()))]
+    if len(matches) != 1:
+        raise RuntimeError(f'Не удалось однозначно определить RP1 GPIO: {matches}')
+    if not Path(f'/dev/gpiochip{matches[0]}').exists():
+        raise RuntimeError(f'/dev/gpiochip{matches[0]} не существует')
+    return matches[0]
 
 
 # ------------------------------------------------------------
@@ -305,11 +315,9 @@ class Controller:
         self.gpiochip = find_rp1_gpiochip()
         self.factory = LGPIOFactory(chip=self.gpiochip)
 
-        self.pwm = PWMOutputDevice(int(gpio["pwm_gpio"]),
-                                   active_high=True,
-                                   initial_value=initial_pwm / 255.0,
-                                   frequency=int(gpio["pwm_frequency_hz"]),
-                                   pin_factory=self.factory)
+        self.pwm = RP1HardwarePWM(int(gpio["pwm_gpio"]),
+                                 initial_value=initial_pwm / 255.0,
+                                 frequency=int(gpio["pwm_frequency_hz"]))
         self.tach = DigitalInputDevice(int(gpio["tach_gpio"]),
                                        pull_up=None,
                                        active_state=False,
@@ -322,7 +330,7 @@ class Controller:
         self.last_rpm_time = time.monotonic()
         self.rpm_ema = 0.0
         self.zero_since: float | None = None
-        self.applied_pwm = initial_pwm
+        self.applied_pwm = int(round(self.pwm.value * 255))
         self.nvme_history: deque[float] = deque(maxlen=int(self.cfg["control"]["nvme_average_samples"]))
         self.cpu_latched_temp: float | None = None
         self.nvme_latched_temp: float | None = None
@@ -697,6 +705,9 @@ class Controller:
                 "pwm_gpio": int(self.cfg["gpio"]["pwm_gpio"]),
                 "tach_gpio": int(self.cfg["gpio"]["tach_gpio"]),
                 "pwm_frequency_hz": int(self.cfg["gpio"]["pwm_frequency_hz"]),
+                "pwm_backend": type(self.pwm).__name__,
+                "pwm_chip": self.pwm.chip.name,
+                "pwm_channel": int(self.pwm.channel.name.removeprefix("pwm")),
                 "target_pwm": target,
                 "applied_pwm": self.applied_pwm,
                 "rpm": int(round(self.rpm_ema)),
